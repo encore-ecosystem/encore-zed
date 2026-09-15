@@ -1,10 +1,24 @@
 # Zed Encore
 
-A [Encore](https://github.com/encore-language/encore) extension for [Zed](https://zed.dev).
+A [Encore](https://github.com/encore-ecosystem/encore) extension for [Zed](https://zed.dev).
 
 ## Development
 
 To develop this extension, see the [Developing Extensions](https://zed.dev/docs/extensions/developing-extensions) section of the Zed docs.
+
+When testing unpublished grammar changes from a sibling `tree-sitter-encore`
+checkout, generate and test that checkout with its pinned CLI, then build the
+local Wasm grammar (the build command requires a CLI with WASI support):
+
+```sh
+(cd ../tree-sitter-encore && node_modules/.bin/tree-sitter generate && node_modules/.bin/tree-sitter test)
+tree-sitter build --wasm --output grammars/encore.wasm ../tree-sitter-encore
+```
+
+Reload the dev extension after changing its manifest version, or restart Zed, so
+the old grammar is not retained in memory. Before publishing the extension, commit
+and publish the grammar and update `grammars.encore.commit` to that exact revision;
+the local Wasm override is ignored by Git and is not a release dependency.
 
 ## Language Server
 
