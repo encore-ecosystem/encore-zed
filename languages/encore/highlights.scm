@@ -20,6 +20,9 @@
   "let"
   "static"
   "mut"
+  "frozen"
+  "sending"
+  "dyn"
   "ret"
   "while"
   "do"
@@ -98,6 +101,9 @@
 ] @punctuation.delimiter
 
 (string_literal) @string
+(formatted_string_literal) @string
+(formatted_string_text) @string
+(formatted_string_interpolation ["{" "}"] @punctuation.special)
 (integer_literal) @number
 (float_literal) @number.float
 (boolean_literal) @boolean

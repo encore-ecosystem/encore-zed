@@ -107,14 +107,8 @@ impl EncoreExtension {
             (zed::Os::Windows, zed::Architecture::Aarch64) => "aarch64-w64-windows-gnu".to_string(),
             (zed::Os::Windows, zed::Architecture::X86) => unreachable!(),
         };
-        let version = release.version.trim_start_matches('v');
-        let archive_suffix = if os == zed::Os::Windows {
-            "zip"
-        } else {
-            "tar.gz"
-        };
-        let package_name = format!("encore-{version}-{triple}");
-        let asset_name = format!("{package_name}.{archive_suffix}");
+        let (package_name, asset_name) =
+            release_layout(&release.version, &triple, os == zed::Os::Windows);
         let asset = release
             .assets
             .iter()
@@ -210,6 +204,42 @@ fn environment_value(environment: &zed::EnvVars, name: &str) -> Option<String> {
         .iter()
         .find(|(candidate, _)| candidate == name)
         .map(|(_, value)| value.clone())
+}
+
+// Release tags select the version. Asset names remain stable for installers,
+// while the archive's inner directory includes the complete release identity.
+fn release_layout(release: &str, triple: &str, windows: bool) -> (String, String) {
+    let version = release.trim_start_matches('v');
+    let suffix = if windows { "zip" } else { "tar.gz" };
+    (
+        format!("encore-{version}-{triple}"),
+        format!("encore-{triple}.{suffix}"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::release_layout;
+
+    #[test]
+    fn named_release_uses_stable_asset_names() {
+        for (triple, windows, suffix) in [
+            ("x86_64-unknown-linux-gnu", false, "tar.gz"),
+            ("aarch64-unknown-linux-gnu", false, "tar.gz"),
+            ("x86_64-apple-darwin", false, "tar.gz"),
+            ("aarch64-apple-darwin", false, "tar.gz"),
+            ("x86_64-pc-windows-msvc", true, "zip"),
+            ("aarch64-w64-windows-gnu", true, "zip"),
+        ] {
+            let (directory, asset) = release_layout("v0.1.0-neumann", triple, windows);
+            assert_eq!(directory, format!("encore-0.1.0-neumann-{triple}"));
+            assert_eq!(asset, format!("encore-{triple}.{suffix}"));
+            assert_eq!(
+                release_layout("0.1.0-neumann", triple, windows),
+                (directory, asset)
+            );
+        }
+    }
 }
 
 zed::register_extension!(EncoreExtension);
