@@ -1,4 +1,5 @@
 use std::fs;
+use std::time::{Duration, SystemTime};
 
 use zed_extension_api::{
     self as zed, settings::LspSettings, LanguageServerInstallationStatus as InstallationStatus,
@@ -12,7 +13,25 @@ struct EncoreBinary {
 }
 
 struct EncoreExtension {
-    cached_binary_path: Option<String>,
+    cached_binary: Option<CachedBinary>,
+}
+
+struct CachedBinary {
+    path: String,
+    checked_at: SystemTime,
+}
+
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+impl CachedBinary {
+    fn is_fresh(&self, now: SystemTime) -> bool {
+        now.duration_since(self.checked_at)
+            .is_ok_and(|age| age < UPDATE_CHECK_INTERVAL)
+    }
+
+    fn exists(&self) -> bool {
+        fs::metadata(&self.path).is_ok_and(|metadata| metadata.is_file())
+    }
 }
 
 const ENCORE_LSP_BINARY: &str = "encore-lsp";
@@ -42,11 +61,14 @@ impl EncoreExtension {
             .and_then(|binary| binary.arguments.clone())
             .unwrap_or_default();
         let configured_path = binary_settings.and_then(|binary| binary.path);
-        let environment_path = environment_value(&command_env, "ENCORE_LSP_PATH")
-            .filter(|path| fs::metadata(path).is_ok_and(|metadata| metadata.is_file()));
-        let path = configured_path
-            .or(environment_path)
-            .or_else(|| worktree.which(ENCORE_LSP_BINARY));
+        // Explicit configuration wins. A broken environment override is an
+        // error, not permission to silently launch an unrelated cached server.
+        let path = match configured_path {
+            Some(path) => Some(path),
+            None => {
+                environment_binary_path(&command_env)?.or_else(|| worktree.which(ENCORE_LSP_BINARY))
+            }
+        };
         if let Some(path) = path {
             return Ok(EncoreBinary {
                 path,
@@ -75,9 +97,10 @@ impl EncoreExtension {
         &mut self,
         language_server_id: &zed::LanguageServerId,
     ) -> Result<String> {
-        if let Some(path) = &self.cached_binary_path {
-            if fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
-                return Ok(path.clone());
+        let now = SystemTime::now();
+        if let Some(binary) = &self.cached_binary {
+            if binary.is_fresh(now) && binary.exists() {
+                return Ok(binary.path.clone());
             }
         }
 
@@ -85,13 +108,30 @@ impl EncoreExtension {
             language_server_id,
             &InstallationStatus::CheckingForUpdate,
         );
-        let release = zed::latest_github_release(
+        let release = match zed::latest_github_release(
             ENCORE_RELEASE_REPOSITORY,
             zed::GithubReleaseOptions {
                 require_assets: true,
                 pre_release: false,
             },
-        )?;
+        ) {
+            Ok(release) => release,
+            Err(error) => {
+                // Keep working offline, but retry on a bounded interval rather
+                // than either checking per worktree or pinning forever.
+                if let Some(binary) = &mut self.cached_binary {
+                    if binary.exists() {
+                        binary.checked_at = now;
+                        zed::set_language_server_installation_status(
+                            language_server_id,
+                            &InstallationStatus::None,
+                        );
+                        return Ok(binary.path.clone());
+                    }
+                }
+                return Err(error);
+            }
+        };
         let (os, architecture) = zed::current_platform();
         let arch = match architecture {
             zed::Architecture::Aarch64 => "aarch64",
@@ -146,7 +186,10 @@ impl EncoreExtension {
         }
 
         zed::set_language_server_installation_status(language_server_id, &InstallationStatus::None);
-        self.cached_binary_path = Some(binary_path.clone());
+        self.cached_binary = Some(CachedBinary {
+            path: binary_path.clone(),
+            checked_at: now,
+        });
         Ok(binary_path)
     }
 }
@@ -157,7 +200,7 @@ impl zed::Extension for EncoreExtension {
         Self: Sized,
     {
         Self {
-            cached_binary_path: None,
+            cached_binary: None,
         }
     }
 
@@ -206,6 +249,16 @@ fn environment_value(environment: &zed::EnvVars, name: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
+fn environment_binary_path(environment: &zed::EnvVars) -> Result<Option<String>> {
+    match environment_value(environment, "ENCORE_LSP_PATH").filter(|path| !path.is_empty()) {
+        Some(path) if fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) => {
+            Ok(Some(path))
+        }
+        Some(path) => Err(format!("ENCORE_LSP_PATH does not point to a file: {path}")),
+        None => Ok(None),
+    }
+}
+
 // Release tags select the version. Asset names remain stable for installers,
 // while the archive's inner directory includes the complete release identity.
 fn release_layout(release: &str, triple: &str, windows: bool) -> (String, String) {
@@ -219,7 +272,8 @@ fn release_layout(release: &str, triple: &str, windows: bool) -> (String, String
 
 #[cfg(test)]
 mod tests {
-    use super::release_layout;
+    use super::{environment_binary_path, release_layout, CachedBinary, UPDATE_CHECK_INTERVAL};
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn named_release_uses_stable_asset_names() {
@@ -231,14 +285,47 @@ mod tests {
             ("x86_64-pc-windows-msvc", true, "zip"),
             ("aarch64-w64-windows-gnu", true, "zip"),
         ] {
-            let (directory, asset) = release_layout("v0.1.0-neumann", triple, windows);
-            assert_eq!(directory, format!("encore-0.1.0-neumann-{triple}"));
+            let (directory, asset) = release_layout("v0.1.2-neumann", triple, windows);
+            assert_eq!(directory, format!("encore-0.1.2-neumann-{triple}"));
             assert_eq!(asset, format!("encore-{triple}.{suffix}"));
             assert_eq!(
-                release_layout("0.1.0-neumann", triple, windows),
+                release_layout("0.1.2-neumann", triple, windows),
                 (directory, asset)
             );
         }
+    }
+
+    #[test]
+    fn managed_update_checks_are_bounded_but_not_permanent() {
+        let checked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let binary = CachedBinary {
+            path: String::new(),
+            checked_at,
+        };
+        assert!(binary.is_fresh(checked_at));
+        assert!(binary.is_fresh(checked_at + UPDATE_CHECK_INTERVAL - Duration::from_secs(1)));
+        assert!(!binary.is_fresh(checked_at + UPDATE_CHECK_INTERVAL));
+        assert!(!binary.is_fresh(checked_at - Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn invalid_environment_override_does_not_silently_fall_back() {
+        assert_eq!(environment_binary_path(&vec![]).unwrap(), None);
+        assert_eq!(
+            environment_binary_path(&vec![("ENCORE_LSP_PATH".into(), "".into())]).unwrap(),
+            None
+        );
+        assert!(
+            environment_binary_path(&vec![("ENCORE_LSP_PATH".into(), "\0invalid".into())]).is_err()
+        );
+        let path = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            environment_binary_path(&vec![("ENCORE_LSP_PATH".into(), path.clone())]).unwrap(),
+            Some(path)
+        );
     }
 }
 
