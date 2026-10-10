@@ -101,8 +101,11 @@
 ] @punctuation.delimiter
 
 (string_literal) @string
-(formatted_string_literal) @string
+((formatted_string_literal _ @string)
+ (#match? @string "^(f)?\"$"))
 (formatted_string_text) @string
+((formatted_string_text) @string.escape
+ (#match? @string.escape "^\\\\."))
 (formatted_string_interpolation ["{" "}"] @punctuation.special)
 (integer_literal) @number
 (float_literal) @number.float
@@ -111,6 +114,8 @@
 
 (smart_pointer_suffix) @type.builtin
 (any_pointer_suffix) @operator
+
+(path_segment name: (identifier) @variable)
 
 (typed_parameter name: (identifier) @variable.parameter)
 (closure_parameter name: (identifier) @variable.parameter)
