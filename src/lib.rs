@@ -133,20 +133,7 @@ impl EncoreExtension {
             }
         };
         let (os, architecture) = zed::current_platform();
-        let arch = match architecture {
-            zed::Architecture::Aarch64 => "aarch64",
-            zed::Architecture::X8664 => "x86_64",
-            zed::Architecture::X86 => {
-                return Err("Encore does not publish a 32-bit Zed language server".into())
-            }
-        };
-        let triple = match (os, architecture) {
-            (zed::Os::Linux, _) => format!("{arch}-unknown-linux-gnu"),
-            (zed::Os::Mac, _) => format!("{arch}-apple-darwin"),
-            (zed::Os::Windows, zed::Architecture::X8664) => "x86_64-pc-windows-msvc".to_string(),
-            (zed::Os::Windows, zed::Architecture::Aarch64) => "aarch64-w64-windows-gnu".to_string(),
-            (zed::Os::Windows, zed::Architecture::X86) => unreachable!(),
-        };
+        let triple = release_target(os, architecture)?;
         let (package_name, asset_name) =
             release_layout(&release.version, &triple, os == zed::Os::Windows);
         let asset = release
@@ -261,6 +248,26 @@ fn environment_binary_path(environment: &zed::EnvVars) -> Result<Option<String>>
 
 // Release tags select the version. Asset names remain stable for installers,
 // while the archive's inner directory includes the complete release identity.
+fn release_target(os: zed::Os, architecture: zed::Architecture) -> Result<String> {
+    let arch = match architecture {
+        zed::Architecture::Aarch64 => "aarch64",
+        zed::Architecture::X8664 => "x86_64",
+        zed::Architecture::X86 => {
+            return Err("Encore does not publish a 32-bit Zed language server".into())
+        }
+    };
+    match (os, architecture) {
+        (zed::Os::Linux, _) => Ok(format!("{arch}-unknown-linux-gnu")),
+        (zed::Os::Mac, zed::Architecture::Aarch64) => Ok("aarch64-apple-darwin".into()),
+        (zed::Os::Mac, _) => Err(
+            "Encore macOS releases require Apple Silicon (M1 or newer); Intel Macs are no longer supported".into(),
+        ),
+        (zed::Os::Windows, zed::Architecture::X8664) => Ok("x86_64-pc-windows-msvc".into()),
+        (zed::Os::Windows, zed::Architecture::Aarch64) => Ok("aarch64-w64-windows-gnu".into()),
+        (zed::Os::Windows, zed::Architecture::X86) => unreachable!(),
+    }
+}
+
 fn release_layout(release: &str, triple: &str, windows: bool) -> (String, String) {
     let version = release.trim_start_matches('v');
     let suffix = if windows { "zip" } else { "tar.gz" };
@@ -272,7 +279,10 @@ fn release_layout(release: &str, triple: &str, windows: bool) -> (String, String
 
 #[cfg(test)]
 mod tests {
-    use super::{environment_binary_path, release_layout, CachedBinary, UPDATE_CHECK_INTERVAL};
+    use super::{
+        environment_binary_path, release_layout, release_target, CachedBinary,
+        UPDATE_CHECK_INTERVAL,
+    };
     use std::time::{Duration, SystemTime};
 
     #[test]
@@ -280,7 +290,6 @@ mod tests {
         for (triple, windows, suffix) in [
             ("x86_64-unknown-linux-gnu", false, "tar.gz"),
             ("aarch64-unknown-linux-gnu", false, "tar.gz"),
-            ("x86_64-apple-darwin", false, "tar.gz"),
             ("aarch64-apple-darwin", false, "tar.gz"),
             ("x86_64-pc-windows-msvc", true, "zip"),
             ("aarch64-w64-windows-gnu", true, "zip"),
@@ -293,6 +302,20 @@ mod tests {
                 (directory, asset)
             );
         }
+    }
+
+    #[test]
+    fn macos_releases_require_apple_silicon() {
+        use zed_extension_api::{Architecture, Os};
+        assert_eq!(
+            release_target(Os::Mac, Architecture::Aarch64).unwrap(),
+            "aarch64-apple-darwin"
+        );
+        assert!(release_target(Os::Mac, Architecture::X8664)
+            .unwrap_err()
+            .contains("Apple Silicon"));
+        assert!(release_target(Os::Linux, Architecture::X8664).is_ok());
+        assert!(release_target(Os::Windows, Architecture::X8664).is_ok());
     }
 
     #[test]
